@@ -1,0 +1,16 @@
+[Unit]
+Description=Update /etc/hosts with Docker container IPs
+After=docker.service
+Requires=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# Give the Docker containers a bit of time to start up
+ExecStartPre=/bin/sleep 30
+ExecStart=/usr/local/bin/docker_etc_hosts
+User=root
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

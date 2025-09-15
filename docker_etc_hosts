@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# Usage: ./docker_etc_hosts [--dry-run] [-h]
+
+set -euo pipefail
+
+# Exit on any command failure
+trap 'echo "Error: Command failed on line $LINENO" >&2; exit 1' ERR
+
+HOSTS_FILE=${HOSTS_FILE:-/etc/hosts}
+DOMAIN_SUFFIX=${DOMAIN_SUFFIX:-.internal}
+DRY_RUN=false
+START_MARKER="# DOCKER_ETC_HOSTS_START"
+END_MARKER="# DOCKER_ETC_HOSTS_END"
+
+show_help() {
+  cat << EOF
+Update /etc/hosts with running Docker containers IPs and names
+
+Usage: $0 [OPTIONS]
+
+OPTIONS:
+  --dry-run    Output new hosts content to stdout instead of updating file
+  -h, --help   Show this help message
+
+ENVIRONMENT VARIABLES:
+  DOMAIN_SUFFIX    Domain suffix for containers (default: .internal)
+  HOSTS_FILE       Target hosts file (default: /etc/hosts)
+
+The script adds /etc/hosts entries between markers:
+  $START_MARKER
+  $END_MARKER
+
+Container names are formatted as: container-name$DOMAIN_SUFFIX
+EOF
+}
+
+# Parse arguments
+if [[ $# -gt 0 ]]; then
+  case $1 in
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    *)
+      echo "Error: Unknown option $1"
+      show_help
+      exit 1
+      ;;
+  esac
+fi
+
+clean_name() {
+  local name="$1"
+  name="${name#/}"           # Remove leading slash
+  name="${name//_/-}"        # Replace underscores with hyphens
+  name="${name// /-}"        # Replace spaces with hyphens
+  name="${name,,}"           # Convert to lowercase
+  echo "$name" | sed 's/[^a-z0-9-]//g'  # Keep only alphanumeric and hyphens
+}
+
+get_docker_entries() {
+  local ip;
+  local name;
+  local rest;
+  docker ps -q | xargs -r docker inspect --format "{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}" | while read -r name ip rest; do
+    if [[ -n "$rest" ]]; then
+      echo "Error: Container $name has multiple IP addresses. This script requires containers to have exactly one network interface." >&2
+      exit 1
+    fi
+    if [[ -n "$ip" ]]; then
+      name=$(clean_name "$name")
+      if [[ -n "${name}" ]]; then
+        echo "$ip ${name}${DOMAIN_SUFFIX}"
+      fi
+    fi
+  done | sort
+}
+
+
+entries=$(get_docker_entries)
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo "$entries"
+else
+  if [[ ! -f "$HOSTS_FILE" ]]; then
+    echo "Error: Hosts file $HOSTS_FILE does not exist" >&2
+    exit 1
+  fi
+
+  start_count=$(grep -c "^$START_MARKER" "$HOSTS_FILE" || true)
+  end_count=$(grep -c "^$END_MARKER" "$HOSTS_FILE" || true)
+
+  if [[ $start_count -eq 0 && $end_count -eq 0 ]]; then
+    # No markers exist, create them
+    echo -e "${START_MARKER}\n${END_MARKER}" >> "$HOSTS_FILE"
+  elif [[ $start_count -eq 1 && $end_count -eq 1 ]]; then
+    # Exactly one pair exists, remove content between markers
+    sed -i "/^$START_MARKER/,/^$END_MARKER/{/^$START_MARKER/!{/^$END_MARKER/!d;}}" "$HOSTS_FILE"
+  else
+    echo "Error: Expected exactly 1 start marker and 1 end marker, found $start_count start and $end_count end markers" >&2
+    exit 1
+  fi
+
+  # Insert new entries between the markers
+  if [[ -n "$entries" ]]; then
+    temp_file=$(mktemp)
+    awk -v start="$START_MARKER" -v end="$END_MARKER" -v entries="$entries" '
+      $0 == start {
+        print $0
+        print entries
+        next
+      }
+      { print }
+    ' "$HOSTS_FILE" > "$temp_file"
+    cat "$temp_file" > "$HOSTS_FILE"
+    rm "$temp_file"
+  fi
+fi

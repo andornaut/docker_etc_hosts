@@ -1,17 +1,15 @@
 # docker_etc_hosts
 
-A lightweight bash script that manages `/etc/hosts` entries for running Docker containers.
+A lightweight bash script that manages `/etc/hosts` entries for running Docker containers for Linux and macOS.
 
-The script queries Docker for running containers and adds host entries with a `.internal` domain suffix, making it easy to access containers by name from the host system.
+The script queries Docker for running containers and updates host entries with a `.internal` domain suffix, making it easy to access containers by name from the host system. Existing entries are updated in-place, and new entries are appended to the hosts file.
 
 For example, if you have running containers named `web_server` and `database`,
 then this script will add the following to `/etc/hosts`:
 
 ```text
-# DOCKER_ETC_HOSTS_START
 172.17.0.2 web-server.internal
 172.17.0.3 database.internal
-# DOCKER_ETC_HOSTS_END
 ```
 
 ## Installation
@@ -26,10 +24,11 @@ sudo cp docker_etc_hosts /usr/local/bin/
 
 ### Installing the systemd service
 
-To automatically update `/etc/hosts` when Docker starts, install the provided systemd service:
+To automatically update `/etc/hosts` when Docker starts, install the [provided systemd unit file](./docker-etc-hosts.service):
 
 ```bash
-# Copy the service file
+# Download the service file
+curl -O https://raw.githubusercontent.com/andornaut/docker_etc_hosts/main/docker-etc-hosts.service
 sudo cp docker-etc-hosts.service /etc/systemd/system/
 
 # Enable and start the service
@@ -47,21 +46,27 @@ sudo docker_etc_hosts
 # Preview changes without modifying the hosts file:
 docker_etc_hosts --dry-run
 
+# Use a custom domain:
+docker_etc_hosts --dry-run --domain local
+
+# Use a custom hosts file:
+docker_etc_hosts --hosts-file /tmp/hosts
+
 # Show help:
 docker_etc_hosts --help
 ```
 
-## Configuration
+```text
+$ ./docker_etc_hosts --help
+Update /etc/hosts with running Docker containers IPs and names
 
-The script can be configured via environment variables:
+Usage: ./docker_etc_hosts [OPTIONS]
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HOSTS_FILE` | `/etc/hosts` | Path to the hosts file |
-| `DOMAIN_SUFFIX` | `.internal` | Suffix for container domain names |
+OPTIONS:
+  --domain DOMAIN            Domain for containers (default: internal)
+  --dry-run                  Write to stdout instead of updating a hosts file
+  --hosts-file FILE          Path to the hosts file (default: /etc/hosts)
+  -h, --help                 Show this help message
 
-Example with custom configuration:
-
-```bash
-HOSTS_FILE=/tmp/hosts DOMAIN_SUFFIX=.local sudo -E docker_etc_hosts
+Container names are formatted as: container-name.DOMAIN
 ```

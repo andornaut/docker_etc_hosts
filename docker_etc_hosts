@@ -27,7 +27,6 @@ Container names are formatted as: container-name.DOMAIN
 EOF
 }
 
-# Parse arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
     --domain)
@@ -37,6 +36,10 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       DOMAIN="$2"
+      if [[ ! "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+        echo "Error: Invalid --domain: $DOMAIN" >&2
+        exit 1
+      fi
       shift 2
       ;;
     --dry-run)
@@ -64,13 +67,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-clean_name() {
+to_hostname() {
   local name="$1"
   name="${name#/}"           # Remove leading slash
   name="${name//_/-}"        # Replace underscores with hyphens
   name="${name// /-}"        # Replace spaces with hyphens
   name="${name,,}"           # Convert to lowercase
-  echo "$name" | sed 's/[^a-z0-9-]//g'  # Keep only alphanumeric and hyphens
+  name=$(echo "$name" | sed 's/[^a-z0-9-]//g')  # Keep only alphanumeric and hyphens
+
+  if [[ "$name" =~ ^[a-z0-9](.*[a-z0-9])*$ ]]; then
+    echo "$name"
+  else
+    echo ""
+  fi
 }
 
 get_docker_entries() {
@@ -85,7 +94,7 @@ get_docker_entries() {
     exit 1
   fi
 
-  local ip name rest container_ids;
+  local container_ids hostname ip name rest;
   container_ids=$(docker ps -q)
 
 	# Perform this check manually instead of using the `-r` flag to `xargs`, b/c the latter isn't supported on macOS
@@ -95,14 +104,16 @@ get_docker_entries() {
 
   echo "$container_ids" | xargs docker inspect --format "{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}" 2>/dev/null | while read -r name ip rest; do
     if [[ -n "$rest" ]]; then
-      echo "Error: Container $name has multiple IP addresses. This script requires containers to have exactly one network interface." >&2
+      echo "Error: Container $name has multiple IP addresses, which is not supported" >&2
       exit 1
     fi
     if [[ -n "$ip" ]]; then
-      name=$(clean_name "$name")
-      if [[ -n "${name}" ]]; then
-        echo "$ip ${name}.${DOMAIN}"
+      hostname=$(to_hostname "$name")
+      if [[ -z "${hostname}" ]]; then
+        echo "Error: The hostname derived from container '$name' is invalid: $hostname" >&2
+        exit 1
       fi
+      echo "$ip ${hostname}.${DOMAIN}"
     fi
   done | sort
 }

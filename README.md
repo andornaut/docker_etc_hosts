@@ -1,11 +1,10 @@
 # docker_etc_hosts
 
-A lightweight bash script that manages `/etc/hosts` entries for running Docker containers for Linux and macOS.
+A lightweight bash script for Linux and macOS to add/update IP->hostname mappings in `/etc/hosts` for running Docker containers.
 
-The script queries Docker for running containers and updates host entries with a `.internal` domain suffix, making it easy to access containers by name from the host system. Existing entries are updated in-place, and new entries are appended to the hosts file.
+The script queries Docker for running containers and updates `/etc/hosts` to map each container's private IP address to its container name as hostname, which makes it easy to access containers by name from the host system. Existing entries are updated in-place, and new entries are appended to the hosts file.
 
-For example, if you have running containers named `web_server` and `database`,
-then this script will add the following to `/etc/hosts`:
+For example, if you have running containers named `web_server` and `database`, then this script will add the following to `/etc/hosts`:
 
 ```text
 172.17.0.2 web-server.internal
@@ -63,7 +62,7 @@ Update /etc/hosts with running Docker containers IPs and names
 Usage: ./docker_etc_hosts [OPTIONS]
 
 OPTIONS:
-  --domain DOMAIN            Domain for containers (default: internal)
+  --domain DOMAIN            Domain to append to container names (default: internal)
   --dry-run                  Write to stdout instead of updating a hosts file
   --hosts-file FILE          Path to the hosts file (default: /etc/hosts)
   -h, --help                 Show this help message

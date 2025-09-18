@@ -32,15 +32,14 @@ while [[ $# -gt 0 ]]; do
     --domain)
       if [[ -z "${2-}" ]]; then
         echo "Error: --domain requires a value" >&2
-        show_help
         exit 1
       fi
       DOMAIN="$2"
+      shift 2
       if [[ ! "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
         echo "Error: Invalid --domain: $DOMAIN" >&2
         exit 1
       fi
-      shift 2
       ;;
     --dry-run)
       DRY_RUN=true
@@ -49,7 +48,6 @@ while [[ $# -gt 0 ]]; do
     --hosts-file)
       if [[ -z "${2-}" ]]; then
         echo "Error: --hosts-file requires a value" >&2
-        show_help
         exit 1
       fi
       HOSTS_FILE="$2"
@@ -61,7 +59,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Error: Unknown option $1" >&2
-      show_help
       exit 1
       ;;
   esac
@@ -78,26 +75,26 @@ to_hostname() {
   if [[ "$name" =~ ^[a-z0-9](.*[a-z0-9])*$ ]]; then
     echo "$name"
   else
-    echo ""
+    echo
   fi
 }
 
 get_docker_entries() {
   # Check if Docker is available and running
   if ! command -v docker >/dev/null 2>&1; then
-    echo "Error: Docker command not found. Please install Docker." >&2
+    echo "Error: Docker command not found" >&2
     exit 1
   fi
 
   if ! docker info >/dev/null 2>&1; then
-    echo "Error: Docker daemon is not running or not accessible. Please start Docker or check permissions." >&2
+    echo "Error: Docker daemon is not running or not accessible" >&2
     exit 1
   fi
 
   local container_ids hostname ip name rest;
   container_ids=$(docker ps -q)
 
-	# Perform this check manually instead of using the `-r` flag to `xargs`, b/c the latter isn't supported on macOS
+  # Perform this check manually instead of using the `-r` flag to `xargs`, b/c the latter isn't supported on macOS
   if [[ -z "$container_ids" ]]; then
     return
   fi
@@ -128,7 +125,7 @@ update_hosts_file() {
   fi
 
   if [[ ! -w "$HOSTS_FILE" ]]; then
-    echo "Error: Cannot write to $HOSTS_FILE. Try running with sudo." >&2
+    echo "Error: Cannot write to $HOSTS_FILE" >&2
     exit 1
   fi
 
@@ -146,7 +143,7 @@ update_hosts_file() {
 entries=$(get_docker_entries)
 
 if [[ -z "$entries" ]]; then
-  echo "Warning: No running Docker containers found with valid network configurations" >&2
+  echo "Warning: No running Docker containers found with applicable network configurations" >&2
   exit 0
 fi
 

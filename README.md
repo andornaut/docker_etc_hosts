@@ -23,7 +23,7 @@ sudo cp docker_etc_hosts /usr/local/bin/
 
 ### Installing the systemd service
 
-To automatically update `/etc/hosts` when Docker starts, install the [provided systemd unit file](./docker-etc-hosts.service):
+To automatically update `/etc/hosts` whenever a Docker container is started, install the [provided systemd unit file](./docker-etc-hosts.service):
 
 ```bash
 # Download the service file

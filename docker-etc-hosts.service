@@ -1,16 +1,15 @@
 [Unit]
-Description=Update /etc/hosts with Docker container IPs
+Description=Monitor Docker events and update /etc/hosts
 After=docker.service
 Requires=docker.service
 Wants=docker.service
 
 [Service]
-Type=oneshot
-# Give the Docker containers a bit of time to start up
-ExecStartPre=/bin/sleep 30
-ExecStart=/usr/local/bin/docker_etc_hosts
+Type=simple
+ExecStart=/bin/bash -c 'docker events --filter event=start --format "{{.Type}}" | while read event; do /usr/local/bin/docker_etc_hosts; done'
+Restart=always
+RestartSec=5
 User=root
-RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target

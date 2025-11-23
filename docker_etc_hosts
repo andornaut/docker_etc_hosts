@@ -100,18 +100,20 @@ get_docker_entries() {
   fi
 
   echo "$container_ids" | xargs docker inspect --format "{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}" 2>/dev/null | while read -r name ip rest; do
+    # Skip containers with no IP (e.g., host networking mode) or invalid IP
+    if [[ -z "$ip" || "$ip" == "invalid" ]]; then
+      continue
+    fi
     if [[ -n "$rest" ]]; then
       echo "Error: Container $name has multiple IP addresses, which is not supported" >&2
       exit 1
     fi
-    if [[ -n "$ip" ]]; then
-      hostname=$(to_hostname "$name")
-      if [[ -z "${hostname}" ]]; then
-        echo "Error: The hostname derived from container '$name' is invalid: $hostname" >&2
-        exit 1
-      fi
-      echo "$ip ${hostname}.${DOMAIN}"
+    hostname=$(to_hostname "$name")
+    if [[ -z "${hostname}" ]]; then
+      echo "Error: The hostname derived from container '$name' is invalid: $hostname" >&2
+      exit 1
     fi
+    echo "$ip ${hostname}.${DOMAIN}"
   done | sort
 }
 

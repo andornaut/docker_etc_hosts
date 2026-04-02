@@ -10,6 +10,9 @@ trap 'echo "Error: Command failed on line $LINENO" >&2; exit 1' ERR
 HOSTS_FILE="/etc/hosts"
 DOMAIN="internal"
 DRY_RUN=false
+CLEAN=false
+MARKER_BEGIN="# docker_etc_hosts BEGIN"
+MARKER_END="# docker_etc_hosts END"
 
 show_help() {
   cat << EOF
@@ -18,6 +21,7 @@ Update /etc/hosts with running Docker containers IPs and names
 Usage: $0 [OPTIONS]
 
 OPTIONS:
+  --clean                    Replace all managed entries instead of updating in-place
   --domain DOMAIN            Domain for containers (default: internal)
   --dry-run                  Write to stdout instead of updating a hosts file
   --hosts-file FILE          Target hosts file (default: /etc/hosts)
@@ -29,6 +33,10 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --clean)
+      CLEAN=true
+      shift
+      ;;
     --domain)
       if [[ -z "${2-}" ]]; then
         echo "Error: --domain requires a value" >&2
@@ -118,9 +126,7 @@ get_docker_entries() {
 }
 
 
-update_hosts_file() {
-  local entries="$1"
-
+validate_hosts_file() {
   if [[ ! -f "$HOSTS_FILE" ]]; then
     echo "Error: Hosts file $HOSTS_FILE does not exist" >&2
     exit 1
@@ -130,22 +136,90 @@ update_hosts_file() {
     echo "Error: Cannot write to $HOSTS_FILE" >&2
     exit 1
   fi
+}
 
-  # Process each entry
+# Remove all lines between and including the markers
+clean_hosts_file() {
   local temp_file
   temp_file=$(mktemp)
 
-  while IFS=' ' read -r ip hostname; do
-    # Check if hostname exists and replace, otherwise append
-    if grep -q "[0-9.]*[[:space:]]*$hostname" "$HOSTS_FILE"; then
-      # Use temp file and cat to preserve inode (avoid sed -i which creates new file)
-      sed "s/[0-9.]*[[:space:]]*$hostname.*/$ip $hostname/" "$HOSTS_FILE" > "$temp_file"
-      cat "$temp_file" > "$HOSTS_FILE"
-    else
-      echo "$ip $hostname" >> "$HOSTS_FILE"
+  local in_block=false
+  while IFS= read -r line; do
+    if [[ "$line" == "$MARKER_BEGIN" ]]; then
+      in_block=true
+      continue
     fi
-  done <<< "$entries"
+    if [[ "$line" == "$MARKER_END" ]]; then
+      in_block=false
+      continue
+    fi
+    if [[ "$in_block" == false ]]; then
+      echo "$line"
+    fi
+  done < "$HOSTS_FILE" > "$temp_file"
 
+  cat "$temp_file" > "$HOSTS_FILE"
+  rm -f "$temp_file"
+}
+
+update_hosts_file() {
+  local entries="$1"
+  local temp_file
+  temp_file=$(mktemp)
+
+  local in_block=false
+  local found_block=false
+  local -A updated_hostnames
+
+  while IFS= read -r line; do
+    if [[ "$line" == "$MARKER_BEGIN" ]]; then
+      in_block=true
+      found_block=true
+      echo "$line"
+      continue
+    fi
+    if [[ "$line" == "$MARKER_END" ]]; then
+      # Append any new entries that weren't updates to existing lines
+      while IFS=' ' read -r ip hostname; do
+        if [[ -z "${updated_hostnames[$hostname]+x}" ]]; then
+          echo "$ip $hostname"
+        fi
+      done <<< "$entries"
+      in_block=false
+      echo "$line"
+      continue
+    fi
+    if [[ "$in_block" == true ]]; then
+      # Check if this line's hostname matches an entry; if so, replace it
+      local line_hostname="${line##* }"
+      local replaced=false
+      while IFS=' ' read -r ip hostname; do
+        if [[ "$hostname" == "$line_hostname" ]]; then
+          echo "$ip $hostname"
+          updated_hostnames[$hostname]=1
+          replaced=true
+          break
+        fi
+      done <<< "$entries"
+      if [[ "$replaced" == false ]]; then
+        # Preserve existing lines in the block that don't match new entries
+        echo "$line"
+      fi
+    else
+      echo "$line"
+    fi
+  done < "$HOSTS_FILE" > "$temp_file"
+
+  # If no block existed, append a new one
+  if [[ "$found_block" == false ]]; then
+    {
+      echo "$MARKER_BEGIN"
+      echo "$entries"
+      echo "$MARKER_END"
+    } >> "$temp_file"
+  fi
+
+  cat "$temp_file" > "$HOSTS_FILE"
   rm -f "$temp_file"
 }
 
@@ -153,12 +227,25 @@ entries=$(get_docker_entries)
 
 if [[ -z "$entries" ]]; then
   echo "Warning: No running Docker containers found with applicable network configurations" >&2
+  if [[ "$CLEAN" == true ]]; then
+    # Still clean stale entries even when no containers are running
+    if [[ "$DRY_RUN" == true ]]; then
+      echo "Would remove all entries between '$MARKER_BEGIN' and '$MARKER_END' from $HOSTS_FILE"
+    else
+      validate_hosts_file
+      clean_hosts_file
+    fi
+  fi
   exit
 fi
 
-if [[ "$DRY_RUN" == "true" ]]; then
+if [[ "$DRY_RUN" == true ]]; then
   echo "$entries"
   exit
 fi
 
+validate_hosts_file
+if [[ "$CLEAN" == true ]]; then
+  clean_hosts_file
+fi
 update_hosts_file "$entries"

@@ -2,13 +2,15 @@
 
 A lightweight bash script for Linux and macOS to add/update IP->hostname mappings in `/etc/hosts` for running Docker containers.
 
-The script queries Docker for running containers and updates `/etc/hosts` to map each container's private IP address to its container name as hostname, which makes it easy to access containers by name from the host system. Existing entries are updated in-place, and new entries are appended to the hosts file.
+The script queries Docker for running containers and updates `/etc/hosts` to map each container's private IP address to its container name as hostname, which makes it easy to access containers by name from the host system. Managed entries are wrapped in `# docker_etc_hosts BEGIN` / `# docker_etc_hosts END` markers. Existing entries are updated in-place, and new entries are appended within the managed block.
 
 For example, if you have running containers named `web_server` and `database`, then this script will add the following to `/etc/hosts`:
 
 ```text
-172.17.0.2 web-server.internal
-172.17.0.3 database.internal
+# docker_etc_hosts BEGIN
+172.17.0.2 database.internal
+172.17.0.3 web-server.internal
+# docker_etc_hosts END
 ```
 
 ## Installation
@@ -42,6 +44,9 @@ sudo systemctl start docker-etc-hosts.service
 # Update `/etc/hosts` with running Docker containers IPs and names:
 sudo docker_etc_hosts
 
+# Replace all managed entries (removes stale hosts from stopped containers):
+sudo docker_etc_hosts --clean
+
 # Preview changes without modifying the hosts file:
 docker_etc_hosts --dry-run
 
@@ -62,9 +67,10 @@ Update /etc/hosts with running Docker containers IPs and names
 Usage: ./docker_etc_hosts [OPTIONS]
 
 OPTIONS:
-  --domain DOMAIN            Domain to append to container names (default: internal)
+  --clean                    Replace all managed entries instead of updating in-place
+  --domain DOMAIN            Domain for containers (default: internal)
   --dry-run                  Write to stdout instead of updating a hosts file
-  --hosts-file FILE          Path to the hosts file (default: /etc/hosts)
+  --hosts-file FILE          Target hosts file (default: /etc/hosts)
   -h, --help                 Show this help message
 
 Container names are formatted as: container-name.DOMAIN

@@ -6,7 +6,7 @@ Wants=docker.service
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c '/usr/local/bin/docker_etc_hosts; docker events --filter event=start --format "{{.Type}}" | while read event; do /usr/local/bin/docker_etc_hosts; done'
+ExecStart=/bin/bash -c '/usr/local/bin/docker_etc_hosts --clean; docker events --filter event=start --format "{{.Type}}" | while read event; do /usr/local/bin/docker_etc_hosts --clean; done'
 Restart=always
 RestartSec=5
 User=root

@@ -253,7 +253,7 @@ warn_shadowed_entries() {
 # are updated in-place and the ones that don't match an entry are preserved.
 render_block() {
   local -A written=()
-  local hostname i line
+  local hostname i j name line
 
   echo "$MARKER_BEGIN"
 
@@ -261,11 +261,19 @@ render_block() {
     for ((i = BLOCK_BEGIN_IDX + 1; i < BLOCK_END_IDX; i++)); do
       line="${HOSTS_LINES[i]}"
       split_hosts_line "$line"
+
+      # A managed hostname can sit anywhere on the line, not just first: a
+      # lookup matches an alias just as readily, so the line answers for it
       hostname=""
-      if (( ${#LINE_FIELDS[@]} > 1 )); then
-        hostname=${LINE_FIELDS[1],,}
-      fi
-      if [[ -z "$hostname" || -z "${ENTRY_IP[$hostname]+x}" ]]; then
+      for ((j = 1; j < ${#LINE_FIELDS[@]}; j++)); do
+        name=${LINE_FIELDS[j],,}
+        if [[ -n "${ENTRY_IP[$name]+x}" ]]; then
+          hostname=$name
+          break
+        fi
+      done
+
+      if [[ -z "$hostname" ]]; then
         # Preserve existing lines in the block that don't match a new entry
         echo "$line"
       elif [[ -z "${written[$hostname]+x}" ]]; then
@@ -289,18 +297,11 @@ render_block() {
 
 # Rewrite $HOSTS_FILE with the managed block set to the indexed entries
 write_hosts_file() {
-  local i link_count temp_file
+  local i temp_file
 
-  # Write beside the target so that the rename below is atomic, which keeps the
-  # file resolvable at every instant and leaves no torn writes behind
-  temp_file=$(mktemp "$(dirname "$HOSTS_FILE")/.$(basename "$HOSTS_FILE").XXXXXX" 2>/dev/null) \
-    || temp_file=$(mktemp)
+  temp_file=$(mktemp)
   # shellcheck disable=SC2064  # $temp_file is expanded now, on purpose
   trap "rm -f -- '$temp_file'" EXIT
-  # Copy first so the rewrite inherits the original's ownership and permissions,
-  # plus its extended attributes and security context where cp supports them
-  cp --preserve=all "$HOSTS_FILE" "$temp_file" 2>/dev/null \
-    || cp -p "$HOSTS_FILE" "$temp_file"
 
   {
     if (( BLOCK_BEGIN_IDX < 0 )); then
@@ -319,18 +320,18 @@ write_hosts_file() {
     fi
   } > "$temp_file"
 
-  link_count=$(stat -c %h "$HOSTS_FILE" 2>/dev/null || stat -f %l "$HOSTS_FILE" 2>/dev/null || echo 1)
-
-  # A rename would replace a symlink rather than what it points at, leave any
-  # hard links to the file behind on the old inode, and can't replace a bind
-  # mount at all - all three are plausible for /etc/hosts - so fall back to
-  # overwriting in place whenever the target isn't a standalone plain file
-  if [[ -L "$HOSTS_FILE" ]] || (( link_count > 1 )) \
-    || ! mv -f "$temp_file" "$HOSTS_FILE" 2>/dev/null; then
-    cat "$temp_file" > "$HOSTS_FILE"
-    rm -f -- "$temp_file"
+  # Say nothing and touch nothing when the file already reads the way it should,
+  # so that a burst of container events doesn't rewrite it once per event
+  if cmp -s "$temp_file" "$HOSTS_FILE"; then
+    return
   fi
-  trap - EXIT
+
+  # Overwrite in place rather than renaming into place. A rename can't be caught
+  # mid-write, but it swaps the file's inode, and /etc/hosts is often a symlink,
+  # hard linked, or bind mounted into a container - all of which would go on
+  # reading the inode this script had just replaced, and silently never update
+  # again. Keeping the inode costs a brief window where the file is short.
+  cat "$temp_file" > "$HOSTS_FILE"
 }
 
 entries=$(get_docker_entries)
@@ -356,13 +357,21 @@ if [[ "$DRY_RUN" == false || -e "$HOSTS_FILE" ]]; then
 fi
 
 if [[ "$DRY_RUN" == true ]]; then
-  if (( ${#ENTRY_HOSTNAMES[@]} == 0 )); then
-    echo "Would remove all entries between '$MARKER_BEGIN' and '$MARKER_END' from $HOSTS_FILE"
-  else
+  if (( ${#ENTRY_HOSTNAMES[@]} > 0 )); then
     for ((i = 0; i < ${#ENTRY_HOSTNAMES[@]}; i++)); do
       echo "${ENTRY_IP[${ENTRY_HOSTNAMES[i]}]} ${ENTRY_HOSTNAMES[i]}"
     done
+  elif (( BLOCK_BEGIN_IDX >= 0 )); then
+    echo "Would remove all entries between '$MARKER_BEGIN' and '$MARKER_END' from $HOSTS_FILE"
+  else
+    echo "Would leave $HOSTS_FILE unchanged"
   fi
+  exit
+fi
+
+# With nothing to write and no block to empty, --clean has nothing to clean:
+# don't leave an empty block behind in a file that never had one
+if (( ${#ENTRY_HOSTNAMES[@]} == 0 && BLOCK_BEGIN_IDX < 0 )); then
   exit
 fi
 

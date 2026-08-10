@@ -256,15 +256,45 @@ hosts "10.9.9.9 web.internal
 run --dry-run
 check_stderr_matches "shadowed entries are previewed" "ahead of the managed block"
 
-echo "== A hosts file with hard links is updated in place =="
+echo "== A managed hostname is matched wherever it sits on the line =="
+containers "abc web 10.0.0.1"
+hosts "$MARKER_BEGIN
+10.9.9.9 alias-name web.internal
+$MARKER_END
+"
+run
+check_hosts_file "the line is replaced, not left in front of a new one" "$MARKER_BEGIN
+10.0.0.1 web.internal
+$MARKER_END"
+
+echo "== --clean leaves a file that has no block alone =="
+containers ""
+hosts "127.0.0.1 localhost
+"
+run --clean
+check_hosts_file "no empty block is added" "127.0.0.1 localhost"
+check "the preview agrees" "Would leave $HOSTS_FILE unchanged" "$(run --clean --dry-run)"
+
+echo "== An update that would change nothing doesn't touch the file =="
 containers "abc web 10.0.0.1"
 hosts "127.0.0.1 localhost
 "
-ln -f "$HOSTS_FILE" "$WORK/hosts-link"
-inode_before=$(stat -c %i "$HOSTS_FILE")
 run
-check "the inode is kept, so the links stay together" "$inode_before" "$(stat -c %i "$HOSTS_FILE")"
-check "the other link sees the update" "$(cat "$HOSTS_FILE")" "$(cat "$WORK/hosts-link")"
+mtime_before=$(stat -c %Y "$HOSTS_FILE")
+inode_before=$(stat -c %i "$HOSTS_FILE")
+touch -d '@0' "$HOSTS_FILE" 2> /dev/null || touch -t 197001010000 "$HOSTS_FILE"
+run
+check "the file is left untouched" "0" "$(stat -c %Y "$HOSTS_FILE")"
+touch -d "@$mtime_before" "$HOSTS_FILE" 2> /dev/null || true
+
+echo "== The file keeps its inode, so links and bind mounts follow it =="
+containers "abc web 10.0.0.2"
+run
+check "the inode is unchanged" "$inode_before" "$(stat -c %i "$HOSTS_FILE")"
+ln -f "$HOSTS_FILE" "$WORK/hosts-link"
+containers "abc web 10.0.0.3"
+run
+check "a hard link sees the update" "$(cat "$HOSTS_FILE")" "$(cat "$WORK/hosts-link")"
 rm -f "$WORK/hosts-link"
 
 echo "== A large hosts file is rewritten without forking per line =="

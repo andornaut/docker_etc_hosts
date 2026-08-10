@@ -210,7 +210,7 @@ $MARKER_END
 "
 run
 check_stderr_matches "an aliased, differently-cased line is named" \
-  "line 2 maps 'WEB.INTERNAL' ahead of the managed block"
+  "line 2 maps 'web.internal' ahead of the managed block"
 
 # Only the first match in a hosts file is used, so a later line can't shadow
 hosts "$MARKER_BEGIN

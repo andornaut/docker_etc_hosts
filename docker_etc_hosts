@@ -132,11 +132,6 @@ validate_hosts_file() {
     exit 1
   fi
 
-  if [[ ! -r "$HOSTS_FILE" ]]; then
-    echo "Error: Cannot read $HOSTS_FILE" >&2
-    exit 1
-  fi
-
   if [[ "$DRY_RUN" == false && ! -w "$HOSTS_FILE" ]]; then
     echo "Error: Cannot write to $HOSTS_FILE" >&2
     exit 1
@@ -152,16 +147,29 @@ BLOCK_END_IDX=-1
 declare -A ENTRY_IP=()
 ENTRY_HOSTNAMES=()
 
-# The fields of the line last passed to split_hosts_line: an IP, then hostnames
-LINE_FIELDS=()
+# The result of the last match_managed_hostname call
+MATCHED_HOSTNAME=""
 
-# Split a hosts file line into LINE_FIELDS. This assigns to a global rather than
-# printing, because a command substitution forks a subshell and this runs for
-# every line of the hosts file, on every container event.
-split_hosts_line() {
-  local line="${1%%#*}"
+# Set MATCHED_HOSTNAME to the first hostname on hosts file line $1 that the
+# managed entries also define, or to empty if there is none. This assigns to a
+# global rather than printing, because a command substitution forks a subshell
+# and this runs for every line of the hosts file, on every container event.
+match_managed_hostname() {
+  local -a fields
+  local i name
+
   # `read -ra` splits on whitespace without expanding globs
-  read -ra LINE_FIELDS <<< "$line"
+  read -ra fields <<< "${1%%#*}"
+  MATCHED_HOSTNAME=""
+
+  # A lookup matches any name on the line, not just the first, and ignores case
+  for ((i = 1; i < ${#fields[@]}; i++)); do
+    name=${fields[i],,}
+    if [[ -n "${ENTRY_IP[$name]+x}" ]]; then
+      MATCHED_HOSTNAME=$name
+      return
+    fi
+  done
 }
 
 # Index the entry list $1 by hostname, dropping container names that collide
@@ -184,9 +192,14 @@ build_entry_index() {
   done <<< "$entries"
 }
 
-# Read $HOSTS_FILE into HOSTS_LINES and locate the managed block. Unbalanced or
-# duplicated markers are an error: guessing at what they delimit risks deleting
-# entries that this script doesn't manage.
+# Read $HOSTS_FILE into HOSTS_LINES and set BLOCK_BEGIN_IDX and BLOCK_END_IDX to
+# the marker lines bounding the managed block. A file with no block gets an empty
+# range at the end, which is where a new block belongs, so that the rest of the
+# script needs no separate case for it; BLOCK_END_IDX > BLOCK_BEGIN_IDX is the
+# test for whether the file already had one.
+#
+# Unbalanced or duplicated markers are an error: guessing at what they delimit
+# risks deleting entries that this script doesn't manage.
 read_hosts_file() {
   local line i
   HOSTS_LINES=()
@@ -222,30 +235,26 @@ read_hosts_file() {
     echo "Error: $HOSTS_FILE line $((BLOCK_BEGIN_IDX + 1)) is a '$MARKER_BEGIN' marker without a matching '$MARKER_END'; add the closing marker or remove the block" >&2
     exit 1
   fi
+
+  if (( BLOCK_BEGIN_IDX < 0 )); then
+    BLOCK_BEGIN_IDX=${#HOSTS_LINES[@]}
+    BLOCK_END_IDX=$((BLOCK_BEGIN_IDX - 1))
+  fi
 }
 
 # Warn about entries that precede the managed block and map one of its
 # hostnames, eg. those written by versions of this script that predate the
 # markers. The first match in a hosts file wins, so they mask the managed entry.
 warn_shadowed_entries() {
-  local hostname i j last
+  local i
 
-  # Lines after the block can't shadow it. Without a block, one is appended to
-  # the end of the file, so every existing line precedes it.
-  last=$BLOCK_BEGIN_IDX
-  if (( last < 0 )); then
-    last=${#HOSTS_LINES[@]}
-  fi
-
-  for ((i = 0; i < last; i++)); do
-    split_hosts_line "${HOSTS_LINES[i]}"
-    for ((j = 1; j < ${#LINE_FIELDS[@]}; j++)); do
-      # Hostname lookups ignore case, so a match here has to as well
-      hostname=${LINE_FIELDS[j],,}
-      if [[ -n "${ENTRY_IP[$hostname]+x}" ]]; then
-        echo "Warning: $HOSTS_FILE line $((i + 1)) maps '${LINE_FIELDS[j]}' ahead of the managed block and will take precedence over it; remove that line" >&2
-      fi
-    done
+  # Only lines ahead of the block can shadow it, since only the first match is
+  # used, and with no block yet BLOCK_BEGIN_IDX is the end of the file
+  for ((i = 0; i < BLOCK_BEGIN_IDX; i++)); do
+    match_managed_hostname "${HOSTS_LINES[i]}"
+    if [[ -n "$MATCHED_HOSTNAME" ]]; then
+      echo "Warning: $HOSTS_FILE line $((i + 1)) maps '$MATCHED_HOSTNAME' ahead of the managed block and will take precedence over it; remove that line" >&2
+    fi
   done
 }
 
@@ -253,29 +262,17 @@ warn_shadowed_entries() {
 # are updated in-place and the ones that don't match an entry are preserved.
 render_block() {
   local -A written=()
-  local hostname i j name line
+  local hostname i
 
   echo "$MARKER_BEGIN"
 
-  if [[ "$CLEAN" == false ]] && (( BLOCK_BEGIN_IDX >= 0 )); then
+  if [[ "$CLEAN" == false ]]; then
     for ((i = BLOCK_BEGIN_IDX + 1; i < BLOCK_END_IDX; i++)); do
-      line="${HOSTS_LINES[i]}"
-      split_hosts_line "$line"
-
-      # A managed hostname can sit anywhere on the line, not just first: a
-      # lookup matches an alias just as readily, so the line answers for it
-      hostname=""
-      for ((j = 1; j < ${#LINE_FIELDS[@]}; j++)); do
-        name=${LINE_FIELDS[j],,}
-        if [[ -n "${ENTRY_IP[$name]+x}" ]]; then
-          hostname=$name
-          break
-        fi
-      done
-
+      match_managed_hostname "${HOSTS_LINES[i]}"
+      hostname=$MATCHED_HOSTNAME
       if [[ -z "$hostname" ]]; then
         # Preserve existing lines in the block that don't match a new entry
-        echo "$line"
+        echo "${HOSTS_LINES[i]}"
       elif [[ -z "${written[$hostname]+x}" ]]; then
         echo "${ENTRY_IP[$hostname]} $hostname"
         written[$hostname]=1
@@ -288,7 +285,6 @@ render_block() {
     hostname=${ENTRY_HOSTNAMES[i]}
     if [[ -z "${written[$hostname]+x}" ]]; then
       echo "${ENTRY_IP[$hostname]} $hostname"
-      written[$hostname]=1
     fi
   done
 
@@ -304,20 +300,13 @@ write_hosts_file() {
   trap "rm -f -- '$temp_file'" EXIT
 
   {
-    if (( BLOCK_BEGIN_IDX < 0 )); then
-      for ((i = 0; i < ${#HOSTS_LINES[@]}; i++)); do
-        echo "${HOSTS_LINES[i]}"
-      done
-      render_block
-    else
-      for ((i = 0; i < BLOCK_BEGIN_IDX; i++)); do
-        echo "${HOSTS_LINES[i]}"
-      done
-      render_block
-      for ((i = BLOCK_END_IDX + 1; i < ${#HOSTS_LINES[@]}; i++)); do
-        echo "${HOSTS_LINES[i]}"
-      done
-    fi
+    for ((i = 0; i < BLOCK_BEGIN_IDX; i++)); do
+      echo "${HOSTS_LINES[i]}"
+    done
+    render_block
+    for ((i = BLOCK_END_IDX + 1; i < ${#HOSTS_LINES[@]}; i++)); do
+      echo "${HOSTS_LINES[i]}"
+    done
   } > "$temp_file"
 
   # Say nothing and touch nothing when the file already reads the way it should,
@@ -348,20 +337,17 @@ fi
 build_entry_index "$entries"
 
 # Inspect the hosts file even for --dry-run, so that a preview reports the same
-# marker errors and shadowed entries that a real run would. A preview of a file
-# that doesn't exist yet is still worth printing, though.
-if [[ "$DRY_RUN" == false || -e "$HOSTS_FILE" ]]; then
-  validate_hosts_file
-  read_hosts_file
-  warn_shadowed_entries
-fi
+# marker errors and shadowed entries that a real run would
+validate_hosts_file
+read_hosts_file
+warn_shadowed_entries
 
 if [[ "$DRY_RUN" == true ]]; then
   if (( ${#ENTRY_HOSTNAMES[@]} > 0 )); then
     for ((i = 0; i < ${#ENTRY_HOSTNAMES[@]}; i++)); do
       echo "${ENTRY_IP[${ENTRY_HOSTNAMES[i]}]} ${ENTRY_HOSTNAMES[i]}"
     done
-  elif (( BLOCK_BEGIN_IDX >= 0 )); then
+  elif (( BLOCK_END_IDX > BLOCK_BEGIN_IDX )); then
     echo "Would remove all entries between '$MARKER_BEGIN' and '$MARKER_END' from $HOSTS_FILE"
   else
     echo "Would leave $HOSTS_FILE unchanged"
@@ -371,7 +357,7 @@ fi
 
 # With nothing to write and no block to empty, --clean has nothing to clean:
 # don't leave an empty block behind in a file that never had one
-if (( ${#ENTRY_HOSTNAMES[@]} == 0 && BLOCK_BEGIN_IDX < 0 )); then
+if (( ${#ENTRY_HOSTNAMES[@]} == 0 && BLOCK_END_IDX < BLOCK_BEGIN_IDX )); then
   exit
 fi
 

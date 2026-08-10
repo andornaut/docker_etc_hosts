@@ -23,6 +23,12 @@ cat > "$WORK/bin/docker" << 'EOF'
 case "$1" in
   info) ;;
   ps) cut -d' ' -f1 < "$CONTAINERS_FILE" ;;
+  events)
+    # Record the arguments so the test can assert on the filters, then replay
+    # the scripted event stream and exit, ending the caller's read loop
+    echo "$*" > "$EVENTS_ARGS_FILE"
+    cat "$EVENTS_FILE"
+    ;;
   inspect)
     # Skip past `inspect --format <format>` to the container ids
     shift 3
@@ -40,6 +46,8 @@ EOF
 chmod +x "$WORK/bin/docker"
 export PATH="$WORK/bin:$PATH"
 export CONTAINERS_FILE="$WORK/containers"
+export EVENTS_FILE="$WORK/events"
+export EVENTS_ARGS_FILE="$WORK/events-args"
 
 HOSTS_FILE="$WORK/hosts"
 passed=0
@@ -223,6 +231,33 @@ $MARKER_BEGIN
 10.0.0.1 web.internal
 $MARKER_END" "$(cat "$WORK/real-hosts")"
 rm -f "$HOSTS_FILE"
+
+echo "== The systemd unit reruns the script on every lifecycle event =="
+# Run the unit's own ExecStart command, with the installed script swapped out
+# for one that records how it was called
+recorder="$WORK/bin/recorder"
+cat > "$recorder" << EOF
+#!/bin/bash
+echo "\$*" >> "$WORK/runs"
+EOF
+chmod +x "$recorder"
+: > "$WORK/runs"
+# A container starting, then one going away
+printf 'container\ncontainer\n' > "$EVENTS_FILE"
+exec_start=$(grep '^ExecStart=' "$SCRIPT_DIR/docker-etc-hosts.service")
+exec_start=${exec_start#ExecStart=/bin/bash -c \'}
+exec_start=${exec_start%\'}
+installed_script=/usr/local/bin/docker_etc_hosts
+bash -c "${exec_start//"$installed_script"/"$recorder"}"
+check "it runs once at startup and once per event" "3" "$(wc -l < "$WORK/runs")"
+check "every run prunes stale entries" "--clean" "$(sort -u "$WORK/runs")"
+for event in start die; do
+  if grep -q -- "--filter event=$event" "$EVENTS_ARGS_FILE"; then
+    check "$event events are watched" "" ""
+  else
+    check "$event events are watched" "--filter event=$event" "$(cat "$EVENTS_ARGS_FILE")"
+  fi
+done
 
 echo
 echo "passed: $passed, failed: $failed"

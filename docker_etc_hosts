@@ -4,13 +4,10 @@
 
 set -euo pipefail
 
-# Exit on any command failure
-trap 'echo "Error: Command failed on line $LINENO" >&2; exit 1' ERR
-
 HOSTS_FILE="/etc/hosts"
 DOMAIN="internal"
 DRY_RUN=false
-CLEAN=false
+WATCH=false
 MARKER_BEGIN="# docker_etc_hosts BEGIN"
 MARKER_END="# docker_etc_hosts END"
 
@@ -21,20 +18,27 @@ Update /etc/hosts with running Docker containers IPs and names
 Usage: $0 [OPTIONS]
 
 OPTIONS:
-  --clean                    Replace all managed entries instead of updating in-place
   --domain DOMAIN            Domain for containers (default: internal)
-  --dry-run                  Write to stdout instead of updating a hosts file
+  --dry-run                  Write the resulting hosts file to stdout instead
   --hosts-file FILE          Target hosts file (default: /etc/hosts)
+  --watch                    Keep running, updating on every container event
   -h, --help                 Show this help message
 
 Container names are formatted as: container-name.DOMAIN
+
+The managed entries are the ones between the '$MARKER_BEGIN' and
+'$MARKER_END' markers, and every run rewrites all of them, so entries
+for containers that are no longer running are removed.
+
+--clean is accepted and ignored: it named the behaviour that is now the only one.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --clean)
-      CLEAN=true
+      # Retained as a no-op so that service files installed by earlier versions,
+      # which always passed it, keep working
       shift
       ;;
     --domain)
@@ -42,12 +46,12 @@ while [[ $# -gt 0 ]]; do
         echo "Error: --domain requires a value" >&2
         exit 1
       fi
-      DOMAIN="$2"
-      shift 2
-      if [[ ! "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
-        echo "Error: Invalid --domain: $DOMAIN" >&2
+      if [[ ! "$2" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+        echo "Error: Invalid --domain: $2" >&2
         exit 1
       fi
+      DOMAIN="$2"
+      shift 2
       ;;
     --dry-run)
       DRY_RUN=true
@@ -61,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       HOSTS_FILE="$2"
       shift 2
       ;;
+    --watch)
+      WATCH=true
+      shift
+      ;;
     -h|--help)
       show_help
       exit
@@ -72,34 +80,55 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-to_hostname() {
-  local name="$1"
-  name="${name#/}"           # Remove leading slash
-  name="${name//_/-}"        # Replace underscores with hyphens
-  name="${name// /-}"        # Replace spaces with hyphens
-  name="${name,,}"           # Convert to lowercase
-  name="${name//[^a-z0-9-]/}"  # Keep only alphanumeric and hyphens
-
-  if [[ "$name" =~ ^[a-z0-9](.*[a-z0-9])*$ ]]; then
-    echo "$name"
-  else
-    echo
-  fi
-}
-
-get_docker_entries() {
-  # Check if Docker is available and running
-  if ! command -v docker >/dev/null 2>&1; then
+require_docker() {
+  if ! command -v docker > /dev/null 2>&1; then
     echo "Error: Docker command not found" >&2
     exit 1
   fi
 
-  if ! docker info >/dev/null 2>&1; then
+  if ! docker info > /dev/null 2>&1; then
     echo "Error: Docker daemon is not running or not accessible" >&2
     exit 1
   fi
+}
 
-  local container_ids hostname ip name rest;
+# Print the hostname label derived from container name $1, or nothing if the
+# name has no valid label in it
+to_hostname() {
+  local name="$1"
+  name="${name#/}"             # Remove leading slash
+  name="${name//_/-}"          # Replace underscores with hyphens
+  name="${name// /-}"          # Replace spaces with hyphens
+  name="${name,,}"             # Convert to lowercase
+  name="${name//[^a-z0-9-]/}"  # Keep only alphanumeric and hyphens
+
+  if [[ "$name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    echo "$name"
+  fi
+}
+
+# Drop entries that repeat a hostname, since a hosts file only honours the
+# first. The input must be sorted by hostname, so that repeats are adjacent.
+drop_repeated_hostnames() {
+  local ip hostname previous_hostname="" previous_ip=""
+
+  while read -r ip hostname; do
+    if [[ "$hostname" == "$previous_hostname" ]]; then
+      echo "Warning: More than one container maps to '$hostname'; keeping $previous_ip and ignoring $ip" >&2
+      continue
+    fi
+    previous_hostname=$hostname
+    previous_ip=$ip
+    echo "$ip $hostname"
+  done
+}
+
+# Print "IP hostname" for every running container, sorted by hostname. A
+# container that can't be mapped is reported and skipped rather than failing the
+# run, so that one unusual container doesn't stop every other one from updating.
+get_docker_entries() {
+  local container_ids hostname ip name
+
   container_ids=$(docker ps -q)
 
   # Perform this check manually instead of using the `-r` flag to `xargs`, b/c the latter isn't supported on macOS
@@ -107,24 +136,26 @@ get_docker_entries() {
     return
   fi
 
-  echo "$container_ids" | xargs docker inspect --format "{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}" 2>/dev/null | while read -r name ip rest; do
-    # Skip containers with no IP (e.g., host networking mode) or invalid IP
-    if [[ -z "$ip" || "$ip" == "invalid" ]]; then
-      continue
-    fi
-    if [[ -n "$rest" ]]; then
-      echo "Error: Container $name has multiple IP addresses, which is not supported" >&2
-      exit 1
-    fi
-    hostname=$(to_hostname "$name")
-    if [[ -z "${hostname}" ]]; then
-      echo "Error: The hostname derived from container '$name' is invalid: $hostname" >&2
-      exit 1
-    fi
-    echo "$ip ${hostname}.${DOMAIN}"
-  done | sort
+  # `{{range}}` yields one address per network the container is attached to, in
+  # sorted network order. Only the first is used: a hosts file maps a name to a
+  # single address, and a container on two networks is normal, not an error.
+  echo "$container_ids" \
+    | xargs docker inspect --format "{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}" \
+    | while read -r name ip _; do
+        # Skip containers with no IP (e.g., host networking mode) or invalid IP
+        if [[ -z "$ip" || "$ip" == "invalid" ]]; then
+          continue
+        fi
+        hostname=$(to_hostname "$name")
+        if [[ -z "$hostname" ]]; then
+          echo "Warning: No valid hostname can be derived from container '$name'; skipping it" >&2
+          continue
+        fi
+        echo "$ip ${hostname}.${DOMAIN}"
+      done \
+    | sort -k2 \
+    | drop_repeated_hostnames
 }
-
 
 validate_hosts_file() {
   if [[ ! -f "$HOSTS_FILE" ]]; then
@@ -142,55 +173,6 @@ validate_hosts_file() {
 HOSTS_LINES=()
 BLOCK_BEGIN_IDX=-1
 BLOCK_END_IDX=-1
-
-# The entries to manage, keyed by hostname, and the order to write them in
-declare -A ENTRY_IP=()
-ENTRY_HOSTNAMES=()
-
-# The result of the last match_managed_hostname call
-MATCHED_HOSTNAME=""
-
-# Set MATCHED_HOSTNAME to the first hostname on hosts file line $1 that the
-# managed entries also define, or to empty if there is none. This assigns to a
-# global rather than printing, because a command substitution forks a subshell
-# and this runs for every line of the hosts file, on every container event.
-match_managed_hostname() {
-  local -a fields
-  local i name
-
-  # `read -ra` splits on whitespace without expanding globs
-  read -ra fields <<< "${1%%#*}"
-  MATCHED_HOSTNAME=""
-
-  # A lookup matches any name on the line, not just the first, and ignores case
-  for ((i = 1; i < ${#fields[@]}; i++)); do
-    name=${fields[i],,}
-    if [[ -n "${ENTRY_IP[$name]+x}" ]]; then
-      MATCHED_HOSTNAME=$name
-      return
-    fi
-  done
-}
-
-# Index the entry list $1 by hostname, dropping container names that collide
-# once they've been normalized, since a hosts file can only honour the first
-build_entry_index() {
-  local entries="$1" hostname ip
-  ENTRY_IP=()
-  ENTRY_HOSTNAMES=()
-
-  while IFS=' ' read -r ip hostname; do
-    if [[ -z "$hostname" ]]; then
-      continue
-    fi
-    if [[ -n "${ENTRY_IP[$hostname]+x}" ]]; then
-      echo "Warning: More than one container maps to '$hostname'; keeping ${ENTRY_IP[$hostname]} and ignoring $ip" >&2
-      continue
-    fi
-    ENTRY_IP[$hostname]=$ip
-    ENTRY_HOSTNAMES+=("$hostname")
-  done <<< "$entries"
-}
 
 # Read $HOSTS_FILE into HOSTS_LINES and set BLOCK_BEGIN_IDX and BLOCK_END_IDX to
 # the marker lines bounding the managed block. A file with no block gets an empty
@@ -242,76 +224,49 @@ read_hosts_file() {
   fi
 }
 
-# Warn about entries that precede the managed block and map one of its
-# hostnames, eg. those written by versions of this script that predate the
-# markers. The first match in a hosts file wins, so they mask the managed entry.
-warn_shadowed_entries() {
-  local i
+# Print $HOSTS_FILE with the managed block replaced by entry list $1
+render_hosts_file() {
+  local entries="$1" i
 
-  # Only lines ahead of the block can shadow it, since only the first match is
-  # used, and with no block yet BLOCK_BEGIN_IDX is the end of the file
   for ((i = 0; i < BLOCK_BEGIN_IDX; i++)); do
-    match_managed_hostname "${HOSTS_LINES[i]}"
-    if [[ -n "$MATCHED_HOSTNAME" ]]; then
-      echo "Warning: $HOSTS_FILE line $((i + 1)) maps '$MATCHED_HOSTNAME' ahead of the managed block and will take precedence over it; remove that line" >&2
-    fi
+    echo "${HOSTS_LINES[i]}"
   done
-}
-
-# Print the managed block. Unless --clean was given, the existing block's lines
-# are updated in-place and the ones that don't match an entry are preserved.
-render_block() {
-  local -A written=()
-  local hostname i
 
   echo "$MARKER_BEGIN"
-
-  if [[ "$CLEAN" == false ]]; then
-    for ((i = BLOCK_BEGIN_IDX + 1; i < BLOCK_END_IDX; i++)); do
-      match_managed_hostname "${HOSTS_LINES[i]}"
-      hostname=$MATCHED_HOSTNAME
-      if [[ -z "$hostname" ]]; then
-        # Preserve existing lines in the block that don't match a new entry
-        echo "${HOSTS_LINES[i]}"
-      elif [[ -z "${written[$hostname]+x}" ]]; then
-        echo "${ENTRY_IP[$hostname]} $hostname"
-        written[$hostname]=1
-      fi
-    done
+  if [[ -n "$entries" ]]; then
+    echo "$entries"
   fi
-
-  # Append the entries that didn't update an existing line
-  for ((i = 0; i < ${#ENTRY_HOSTNAMES[@]}; i++)); do
-    hostname=${ENTRY_HOSTNAMES[i]}
-    if [[ -z "${written[$hostname]+x}" ]]; then
-      echo "${ENTRY_IP[$hostname]} $hostname"
-    fi
-  done
-
   echo "$MARKER_END"
+
+  for ((i = BLOCK_END_IDX + 1; i < ${#HOSTS_LINES[@]}; i++)); do
+    echo "${HOSTS_LINES[i]}"
+  done
 }
 
-# Rewrite $HOSTS_FILE with the managed block set to the indexed entries
-write_hosts_file() {
-  local i temp_file
+update() {
+  local entries rendered
 
-  temp_file=$(mktemp)
-  # shellcheck disable=SC2064  # $temp_file is expanded now, on purpose
-  trap "rm -f -- '$temp_file'" EXIT
+  entries=$(get_docker_entries)
 
-  {
-    for ((i = 0; i < BLOCK_BEGIN_IDX; i++)); do
-      echo "${HOSTS_LINES[i]}"
-    done
-    render_block
-    for ((i = BLOCK_END_IDX + 1; i < ${#HOSTS_LINES[@]}; i++)); do
-      echo "${HOSTS_LINES[i]}"
-    done
-  } > "$temp_file"
+  validate_hosts_file
+  read_hosts_file
+
+  if [[ -z "$entries" ]] && (( BLOCK_END_IDX < BLOCK_BEGIN_IDX )); then
+    # There are no entries to write and no block to empty, so don't leave a bare
+    # block behind in a file that never had one
+    rendered=$(cat "$HOSTS_FILE")
+  else
+    rendered=$(render_hosts_file "$entries")
+  fi
+
+  if [[ "$DRY_RUN" == true ]]; then
+    printf '%s\n' "$rendered"
+    return
+  fi
 
   # Say nothing and touch nothing when the file already reads the way it should,
   # so that a burst of container events doesn't rewrite it once per event
-  if cmp -s "$temp_file" "$HOSTS_FILE"; then
+  if [[ "$rendered" == "$(cat "$HOSTS_FILE")" ]]; then
     return
   fi
 
@@ -320,45 +275,28 @@ write_hosts_file() {
   # hard linked, or bind mounted into a container - all of which would go on
   # reading the inode this script had just replaced, and silently never update
   # again. Keeping the inode costs a brief window where the file is short.
-  cat "$temp_file" > "$HOSTS_FILE"
+  printf '%s\n' "$rendered" > "$HOSTS_FILE"
 }
 
-entries=$(get_docker_entries)
+# Update once, then again after every container event, until `docker events`
+# ends - which it does when the daemon goes away, leaving the service to be
+# restarted against a daemon that has come back.
+watch_docker_events() {
+  update
 
-if [[ -z "$entries" ]]; then
-  echo "Warning: No running Docker containers found with applicable network configurations" >&2
-  # Without --clean there is nothing to write, but --clean still has stale
-  # entries to remove even when no containers are running
-  if [[ "$CLEAN" == false ]]; then
-    exit
-  fi
+  docker events --filter event=start --filter event=die --format "{{.Type}}" \
+    | while read -r _; do
+        # A failed update shouldn't end the watch. The subshell confines the
+        # `exit` that an update raises on an unusable hosts file, so that a
+        # hand-edit that breaks the markers can be fixed without a restart.
+        (update) || echo "Warning: Update failed; retrying on the next container event" >&2
+      done
+}
+
+require_docker
+
+if [[ "$WATCH" == true ]]; then
+  watch_docker_events
+else
+  update
 fi
-
-build_entry_index "$entries"
-
-# Inspect the hosts file even for --dry-run, so that a preview reports the same
-# marker errors and shadowed entries that a real run would
-validate_hosts_file
-read_hosts_file
-warn_shadowed_entries
-
-if [[ "$DRY_RUN" == true ]]; then
-  if (( ${#ENTRY_HOSTNAMES[@]} > 0 )); then
-    for ((i = 0; i < ${#ENTRY_HOSTNAMES[@]}; i++)); do
-      echo "${ENTRY_IP[${ENTRY_HOSTNAMES[i]}]} ${ENTRY_HOSTNAMES[i]}"
-    done
-  elif (( BLOCK_END_IDX > BLOCK_BEGIN_IDX )); then
-    echo "Would remove all entries between '$MARKER_BEGIN' and '$MARKER_END' from $HOSTS_FILE"
-  else
-    echo "Would leave $HOSTS_FILE unchanged"
-  fi
-  exit
-fi
-
-# With nothing to write and no block to empty, --clean has nothing to clean:
-# don't leave an empty block behind in a file that never had one
-if (( ${#ENTRY_HOSTNAMES[@]} == 0 && BLOCK_END_IDX < BLOCK_BEGIN_IDX )); then
-  exit
-fi
-
-write_hosts_file

@@ -4,6 +4,8 @@ A lightweight bash script for Linux and macOS to add/update IP->hostname mapping
 
 The script queries Docker for running containers and updates `/etc/hosts` to map each container's private IP address to its container name as hostname, which makes it easy to access containers by name from the host system. Managed entries are wrapped in `# docker_etc_hosts BEGIN` / `# docker_etc_hosts END` markers. Existing entries are updated in-place, and new entries are appended within the managed block.
 
+Only the managed block is ever rewritten, and the hosts file is replaced atomically, so it stays complete and resolvable even if the script is interrupted. If the markers are unbalanced or duplicated — for example after a hand-edit — the script reports the offending line and exits without writing anything, rather than guessing at which entries it's allowed to delete. It also warns about entries that map a managed hostname from outside the block, such as those written by versions of this script that predate the markers, because the first match in a hosts file wins and those entries would mask the managed one.
+
 For example, if you have running containers named `web_server` and `database`, then this script will add the following to `/etc/hosts`:
 
 ```text
@@ -74,4 +76,13 @@ OPTIONS:
   -h, --help                 Show this help message
 
 Container names are formatted as: container-name.DOMAIN
+```
+
+## Development
+
+[ShellCheck](https://www.shellcheck.net/) lints the scripts, and `test_docker_etc_hosts` exercises `docker_etc_hosts` against synthetic hosts files with a stubbed `docker` command. Both run in CI:
+
+```bash
+shellcheck docker_etc_hosts test_docker_etc_hosts
+./test_docker_etc_hosts
 ```

@@ -1,0 +1,229 @@
+#!/bin/bash
+
+# Usage: ./test_docker_etc_hosts
+#
+# Runs docker_etc_hosts against synthetic hosts files, with a stubbed `docker`
+# on the PATH, and asserts on the result.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT="$SCRIPT_DIR/docker_etc_hosts"
+MARKER_BEGIN="# docker_etc_hosts BEGIN"
+MARKER_END="# docker_etc_hosts END"
+
+WORK=$(mktemp -d)
+trap 'rm -rf -- "$WORK"' EXIT
+
+# Stub `docker` with one that reports the containers listed in $CONTAINERS_FILE,
+# one "id name ip" per line
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/docker" << 'EOF'
+#!/bin/bash
+case "$1" in
+  info) ;;
+  ps) cut -d' ' -f1 < "$CONTAINERS_FILE" ;;
+  inspect)
+    # Skip past `inspect --format <format>` to the container ids
+    shift 3
+    for wanted in "$@"; do
+      while read -r id name ip; do
+        if [[ "$id" == "$wanted" ]]; then
+          # Container names are `/`-prefixed, as `{{.Name}}` reports them
+          echo "/$name $ip "
+        fi
+      done < "$CONTAINERS_FILE"
+    done
+    ;;
+esac
+EOF
+chmod +x "$WORK/bin/docker"
+export PATH="$WORK/bin:$PATH"
+export CONTAINERS_FILE="$WORK/containers"
+
+HOSTS_FILE="$WORK/hosts"
+passed=0
+failed=0
+
+# Declare the running containers, as "id name ip" arguments
+containers() {
+  printf '%s\n' "$@" > "$CONTAINERS_FILE"
+}
+
+# Write $1 to the hosts file under test
+hosts() {
+  printf '%s' "$1" > "$HOSTS_FILE"
+}
+
+# Run the script under test, capturing stderr in $WORK/err
+run() {
+  "$SCRIPT" --hosts-file "$HOSTS_FILE" "$@" 2> "$WORK/err"
+}
+
+check() {
+  local name="$1" expected="$2" actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    echo "PASS: $name"
+    passed=$((passed + 1))
+    return
+  fi
+  echo "FAIL: $name"
+  echo "--- expected ---"
+  printf '%s\n' "$expected"
+  echo "--- actual ---"
+  printf '%s\n' "$actual"
+  echo "--------------"
+  failed=$((failed + 1))
+}
+
+check_hosts_file() {
+  check "$1" "$2" "$(cat "$HOSTS_FILE")"
+}
+
+check_stderr_matches() {
+  local name="$1" pattern="$2"
+  if grep -q -- "$pattern" "$WORK/err"; then
+    check "$name" "" ""
+  else
+    check "$name" "stderr matching: $pattern" "$(cat "$WORK/err")"
+  fi
+}
+
+echo "== A hosts file that doesn't end in a newline keeps its last line =="
+containers "abc web 10.0.0.1"
+hosts "127.0.0.1 localhost
+8.8.8.8 dns.example"
+run
+check_hosts_file "the unterminated line survives" "127.0.0.1 localhost
+8.8.8.8 dns.example
+$MARKER_BEGIN
+10.0.0.1 web.internal
+$MARKER_END"
+
+echo "== Entries are updated in-place, preserving surrounding content =="
+containers "abc web 10.0.0.1"
+hosts "127.0.0.1 localhost
+$MARKER_BEGIN
+# a note
+
+10.9.9.9 web.internal web
+$MARKER_END
+192.168.1.5 important.corp
+"
+run
+check_hosts_file "the aliased line is updated, not duplicated" "127.0.0.1 localhost
+$MARKER_BEGIN
+# a note
+
+10.0.0.1 web.internal
+$MARKER_END
+192.168.1.5 important.corp"
+
+echo "== Repeated runs converge =="
+containers "abc web 10.0.0.1"
+hosts "127.0.0.1 localhost
+"
+run --clean
+run --clean
+run --clean
+check_hosts_file "the file stops changing" "127.0.0.1 localhost
+$MARKER_BEGIN
+10.0.0.1 web.internal
+$MARKER_END"
+
+echo "== --clean drops stopped containers, a plain run keeps them =="
+containers "abc web 10.0.0.1" "def db 10.0.0.2"
+hosts "127.0.0.1 localhost
+"
+run
+containers "abc web 10.0.0.1"
+run
+check_hosts_file "a plain run preserves the stopped container" "127.0.0.1 localhost
+$MARKER_BEGIN
+10.0.0.1 web.internal
+10.0.0.2 db.internal
+$MARKER_END"
+run --clean
+check_hosts_file "--clean removes the stopped container" "127.0.0.1 localhost
+$MARKER_BEGIN
+10.0.0.1 web.internal
+$MARKER_END"
+
+echo "== With no running containers, --clean empties the block =="
+containers ""
+hosts "127.0.0.1 localhost
+$MARKER_BEGIN
+10.9.9.9 web.internal
+$MARKER_END
+"
+before=$(cat "$HOSTS_FILE")
+run
+check_hosts_file "a plain run changes nothing" "$before"
+run --clean
+check_hosts_file "--clean leaves an empty block" "127.0.0.1 localhost
+$MARKER_BEGIN
+$MARKER_END"
+
+echo "== Unbalanced markers are refused rather than guessed at =="
+containers "abc web 10.0.0.1"
+for broken in \
+  "$MARKER_END" \
+  "$MARKER_BEGIN" \
+  "$MARKER_BEGIN
+$MARKER_END
+$MARKER_BEGIN
+$MARKER_END"; do
+  hosts "127.0.0.1 localhost
+$broken
+10.9.9.9 web.internal
+192.168.1.5 important.corp
+"
+  before=$(cat "$HOSTS_FILE")
+  run --clean
+  check "the exit status is 1" "1" "$?"
+  check_hosts_file "no entries are lost" "$before"
+  check_stderr_matches "the offending line is named" "^Error: .* line [0-9]"
+done
+
+echo "== Entries outside the block are reported as shadowing =="
+containers "abc web 10.0.0.1"
+hosts "127.0.0.1 localhost
+10.9.9.9 web.internal
+"
+run
+check_stderr_matches "the shadowing line is named" \
+  "line 2 maps 'web.internal' outside of the managed block"
+
+echo "== --dry-run leaves the hosts file alone =="
+containers "abc web 10.0.0.1"
+hosts "127.0.0.1 localhost
+"
+check "the entries are printed" "10.0.0.1 web.internal" \
+  "$("$SCRIPT" --hosts-file "$HOSTS_FILE" --dry-run 2> /dev/null)"
+check_hosts_file "the file is untouched" "127.0.0.1 localhost"
+
+echo "== Ownership and permissions survive a rewrite =="
+containers "abc web 10.0.0.1"
+hosts "127.0.0.1 localhost
+"
+chmod 640 "$HOSTS_FILE"
+run
+check "the mode is preserved" "640" "$(stat -c %a "$HOSTS_FILE" 2> /dev/null || stat -f %Lp "$HOSTS_FILE")"
+check "no temporary files are left behind" "" "$(find "$WORK" -maxdepth 1 -name '.hosts.*')"
+
+echo "== A symlinked hosts file is followed, not replaced =="
+containers "abc web 10.0.0.1"
+printf '127.0.0.1 localhost\n' > "$WORK/real-hosts"
+rm -f "$HOSTS_FILE"
+ln -s "$WORK/real-hosts" "$HOSTS_FILE"
+run
+check "the symlink survives" "$WORK/real-hosts" "$(readlink "$HOSTS_FILE")"
+check "the target is updated" "127.0.0.1 localhost
+$MARKER_BEGIN
+10.0.0.1 web.internal
+$MARKER_END" "$(cat "$WORK/real-hosts")"
+rm -f "$HOSTS_FILE"
+
+echo
+echo "passed: $passed, failed: $failed"
+[[ "$failed" -eq 0 ]]

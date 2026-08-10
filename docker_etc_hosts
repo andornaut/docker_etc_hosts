@@ -127,20 +127,14 @@ drop_repeated_hostnames() {
 # container that can't be mapped is reported and skipped rather than failing the
 # run, so that one unusual container doesn't stop every other one from updating.
 get_docker_entries() {
-  local container_ids hostname ip name
-
-  container_ids=$(docker ps -q)
-
-  # Perform this check manually instead of using the `-r` flag to `xargs`, b/c the latter isn't supported on macOS
-  if [[ -z "$container_ids" ]]; then
-    return
-  fi
+  local hostname ip name
 
   # `{{range}}` yields one address per network the container is attached to, in
   # sorted network order. Only the first is used: a hosts file maps a name to a
   # single address, and a container on two networks is normal, not an error.
-  echo "$container_ids" \
-    | xargs docker inspect --format "{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}" \
+  # `-r` keeps `xargs` from running `docker inspect` when nothing is up.
+  docker ps -q \
+    | xargs -r docker inspect --format "{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}" \
     | while read -r name ip _; do
         # Skip containers with no IP (e.g., host networking mode) or invalid IP
         if [[ -z "$ip" || "$ip" == "invalid" ]]; then
@@ -292,6 +286,13 @@ watch_docker_events() {
         (update) || echo "Warning: Update failed; retrying on the next container event" >&2
       done
 }
+
+# Linux only, on purpose: `xargs -r` and the systemd unit are GNU/systemd-isms,
+# and container IPs generally aren't routable from a macOS host anyway
+if [[ "$OSTYPE" != linux* ]]; then
+  echo "Error: docker_etc_hosts supports Linux only, not $OSTYPE" >&2
+  exit 1
+fi
 
 require_docker
 

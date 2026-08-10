@@ -25,7 +25,7 @@ For example, if you have running containers named `web_server` and `database`, t
 
 Linux, Docker, and bash 4+.
 
-macOS isn't supported: container IPs aren't routable from the host there, so the entries this script writes wouldn't resolve to anything reachable.
+macOS is explicitly unsupported, and the script exits rather than run there. Under Docker Desktop's default networking, container IPs aren't routable from the host, so the entries would name addresses nothing can reach. Runtimes that do route them — OrbStack, or Docker Desktop plus a tunnel such as [docker-mac-net-connect](https://github.com/chipmk/docker-mac-net-connect) — would additionally need a launchd daemon in place of the systemd unit and BSD-compatible tooling throughout. That isn't a trade this project makes.
 
 ## Installation
 

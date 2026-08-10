@@ -294,10 +294,10 @@ hosts "127.0.0.1 localhost
 run
 mtime_before=$(stat -c %Y "$HOSTS_FILE")
 inode_before=$(stat -c %i "$HOSTS_FILE")
-touch -d '@0' "$HOSTS_FILE" 2> /dev/null || touch -t 197001010000 "$HOSTS_FILE"
+touch -d '@0' "$HOSTS_FILE"
 run
 check "the file is left untouched" "0" "$(stat -c %Y "$HOSTS_FILE")"
-touch -d "@$mtime_before" "$HOSTS_FILE" 2> /dev/null || true
+touch -d "@$mtime_before" "$HOSTS_FILE"
 
 echo "== The file keeps its inode, so links and bind mounts follow it =="
 containers "abc web 10.0.0.2"
@@ -324,7 +324,7 @@ hosts "127.0.0.1 localhost
 "
 chmod 640 "$HOSTS_FILE"
 run
-check "the mode is preserved" "640" "$(stat -c %a "$HOSTS_FILE" 2> /dev/null || stat -f %Lp "$HOSTS_FILE")"
+check "the mode is preserved" "640" "$(stat -c %a "$HOSTS_FILE")"
 
 echo "== A symlinked hosts file is followed, not replaced =="
 containers "abc web 10.0.0.1"
@@ -387,6 +387,17 @@ check_stderr_matches "the offending line is named" "^Error: .* line [0-9]"
 check "the watch survived to see both events" "2" \
   "$(grep -c -- "retrying on the next container event" "$WORK/err")"
 rm -f "$EVENTS_HOOK"
+
+echo "== Only Linux is supported =="
+containers "abc web 10.0.0.1"
+hosts "127.0.0.1 localhost
+"
+OSTYPE=darwin23 run
+check "the exit status is 1" "1" "$?"
+check_hosts_file "the hosts file is untouched" "127.0.0.1 localhost"
+check_stderr_matches "the platform is named" "supports Linux only, not darwin23"
+run
+check "the same run works on Linux" "0" "$?"
 
 echo "== The systemd unit runs the script in watch mode =="
 exec_start=$(grep '^ExecStart=' "$SCRIPT_DIR/docker-etc-hosts.service")

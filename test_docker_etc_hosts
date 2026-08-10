@@ -193,14 +193,88 @@ $broken
   check_stderr_matches "the offending line is named" "^Error: .* line [0-9]"
 done
 
-echo "== Entries outside the block are reported as shadowing =="
+echo "== Entries ahead of the block are reported as shadowing =="
 containers "abc web 10.0.0.1"
 hosts "127.0.0.1 localhost
 10.9.9.9 web.internal
 "
 run
 check_stderr_matches "the shadowing line is named" \
-  "line 2 maps 'web.internal' outside of the managed block"
+  "line 2 maps 'web.internal' ahead of the managed block"
+
+# A hosts file lookup ignores case and considers every name on the line
+hosts "127.0.0.1 localhost
+10.9.9.9 host WEB.INTERNAL
+$MARKER_BEGIN
+$MARKER_END
+"
+run
+check_stderr_matches "an aliased, differently-cased line is named" \
+  "line 2 maps 'WEB.INTERNAL' ahead of the managed block"
+
+# Only the first match in a hosts file is used, so a later line can't shadow
+hosts "$MARKER_BEGIN
+$MARKER_END
+10.9.9.9 web.internal
+"
+run
+check "a line after the block isn't reported" "" "$(cat "$WORK/err")"
+
+echo "== Container names that normalize to one hostname yield one entry =="
+containers "abc my_app 10.0.0.1" "def my-app 10.0.0.2"
+hosts ""
+run
+check_hosts_file "the colliding entry is dropped, not duplicated" "$MARKER_BEGIN
+10.0.0.1 my-app.internal
+$MARKER_END"
+check_stderr_matches "the collision is reported" "More than one container maps to 'my-app.internal'"
+
+echo "== A differently-cased entry in the block is updated, not duplicated =="
+containers "abc web 10.0.0.1"
+hosts "$MARKER_BEGIN
+10.9.9.9 WEB.internal
+$MARKER_END
+"
+run
+check_hosts_file "the entry is replaced in place" "$MARKER_BEGIN
+10.0.0.1 web.internal
+$MARKER_END"
+
+echo "== --dry-run previews what a real run would report =="
+containers "abc web 10.0.0.1"
+hosts "$MARKER_END
+127.0.0.1 localhost
+"
+before=$(cat "$HOSTS_FILE")
+run --dry-run
+check "unbalanced markers fail the preview too" "1" "$?"
+check_hosts_file "the file is untouched" "$before"
+check_stderr_matches "the offending line is named" "^Error: .* line 1"
+
+hosts "10.9.9.9 web.internal
+"
+run --dry-run
+check_stderr_matches "shadowed entries are previewed" "ahead of the managed block"
+
+echo "== A hosts file with hard links is updated in place =="
+containers "abc web 10.0.0.1"
+hosts "127.0.0.1 localhost
+"
+ln -f "$HOSTS_FILE" "$WORK/hosts-link"
+inode_before=$(stat -c %i "$HOSTS_FILE")
+run
+check "the inode is kept, so the links stay together" "$inode_before" "$(stat -c %i "$HOSTS_FILE")"
+check "the other link sees the update" "$(cat "$HOSTS_FILE")" "$(cat "$WORK/hosts-link")"
+rm -f "$WORK/hosts-link"
+
+echo "== A large hosts file is rewritten without forking per line =="
+containers "abc web 10.0.0.1"
+awk 'BEGIN { for (i = 0; i < 20000; i++) print "10.1." int(i / 256) "." (i % 256) " host" i ".example" }' > "$HOSTS_FILE"
+started=$SECONDS
+run
+check "20k lines finish in a few seconds" "under 10s" \
+  "$(if (( SECONDS - started < 10 )); then echo "under 10s"; else echo "$((SECONDS - started))s"; fi)"
+check "the block is appended once" "1" "$(grep -c -- "^$MARKER_BEGIN$" "$HOSTS_FILE")"
 
 echo "== --dry-run leaves the hosts file alone =="
 containers "abc web 10.0.0.1"

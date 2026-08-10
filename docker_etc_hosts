@@ -132,7 +132,12 @@ validate_hosts_file() {
     exit 1
   fi
 
-  if [[ ! -w "$HOSTS_FILE" ]]; then
+  if [[ ! -r "$HOSTS_FILE" ]]; then
+    echo "Error: Cannot read $HOSTS_FILE" >&2
+    exit 1
+  fi
+
+  if [[ "$DRY_RUN" == false && ! -w "$HOSTS_FILE" ]]; then
     echo "Error: Cannot write to $HOSTS_FILE" >&2
     exit 1
   fi
@@ -143,36 +148,40 @@ HOSTS_LINES=()
 BLOCK_BEGIN_IDX=-1
 BLOCK_END_IDX=-1
 
-# Every hostname that a hosts file line defines, one per line
-hosts_line_hostnames() {
+# The entries to manage, keyed by hostname, and the order to write them in
+declare -A ENTRY_IP=()
+ENTRY_HOSTNAMES=()
+
+# The fields of the line last passed to split_hosts_line: an IP, then hostnames
+LINE_FIELDS=()
+
+# Split a hosts file line into LINE_FIELDS. This assigns to a global rather than
+# printing, because a command substitution forks a subshell and this runs for
+# every line of the hosts file, on every container event.
+split_hosts_line() {
   local line="${1%%#*}"
-  local -a fields=()
   # `read -ra` splits on whitespace without expanding globs
-  read -ra fields <<< "$line"
-
-  local i
-  for ((i = 1; i < ${#fields[@]}; i++)); do
-    echo "${fields[i]}"
-  done
+  read -ra LINE_FIELDS <<< "$line"
 }
 
-# The canonical (first) hostname of a hosts file line, or empty if it has none
-hosts_line_hostname() {
-  local hostnames
-  hostnames=$(hosts_line_hostnames "$1")
-  echo "${hostnames%%$'\n'*}"
-}
+# Index the entry list $1 by hostname, dropping container names that collide
+# once they've been normalized, since a hosts file can only honour the first
+build_entry_index() {
+  local entries="$1" hostname ip
+  ENTRY_IP=()
+  ENTRY_HOSTNAMES=()
 
-# The IP that the entry list $1 assigns to hostname $2, or empty if it has none
-entry_ip() {
-  local entries="$1" wanted="$2" ip hostname
   while IFS=' ' read -r ip hostname; do
-    if [[ "$hostname" == "$wanted" ]]; then
-      echo "$ip"
-      return
+    if [[ -z "$hostname" ]]; then
+      continue
     fi
+    if [[ -n "${ENTRY_IP[$hostname]+x}" ]]; then
+      echo "Warning: More than one container maps to '$hostname'; keeping ${ENTRY_IP[$hostname]} and ignoring $ip" >&2
+      continue
+    fi
+    ENTRY_IP[$hostname]=$ip
+    ENTRY_HOSTNAMES+=("$hostname")
   done <<< "$entries"
-  echo
 }
 
 # Read $HOSTS_FILE into HOSTS_LINES and locate the managed block. Unbalanced or
@@ -215,73 +224,72 @@ read_hosts_file() {
   fi
 }
 
-# Warn about entries outside the managed block that shadow the ones within it,
-# eg. those written by versions of this script that predate the markers. The
-# first match in a hosts file wins, so they'd mask the managed entry forever.
+# Warn about entries that precede the managed block and map one of its
+# hostnames, eg. those written by versions of this script that predate the
+# markers. The first match in a hosts file wins, so they mask the managed entry.
 warn_shadowed_entries() {
-  local entries="$1"
-  local -A managed=()
-  local hostname i ip
+  local hostname i j last
 
-  while IFS=' ' read -r ip hostname; do
-    if [[ -n "$hostname" ]]; then
-      managed[$hostname]=1
-    fi
-  done <<< "$entries"
+  # Lines after the block can't shadow it. Without a block, one is appended to
+  # the end of the file, so every existing line precedes it.
+  last=$BLOCK_BEGIN_IDX
+  if (( last < 0 )); then
+    last=${#HOSTS_LINES[@]}
+  fi
 
-  for ((i = 0; i < ${#HOSTS_LINES[@]}; i++)); do
-    if (( BLOCK_BEGIN_IDX >= 0 && i >= BLOCK_BEGIN_IDX && i <= BLOCK_END_IDX )); then
-      continue
-    fi
-    while IFS= read -r hostname; do
-      if [[ -n "$hostname" && -n "${managed[$hostname]+x}" ]]; then
-        echo "Warning: $HOSTS_FILE line $((i + 1)) maps '$hostname' outside of the managed block and will take precedence over it; remove that line" >&2
+  for ((i = 0; i < last; i++)); do
+    split_hosts_line "${HOSTS_LINES[i]}"
+    for ((j = 1; j < ${#LINE_FIELDS[@]}; j++)); do
+      # Hostname lookups ignore case, so a match here has to as well
+      hostname=${LINE_FIELDS[j],,}
+      if [[ -n "${ENTRY_IP[$hostname]+x}" ]]; then
+        echo "Warning: $HOSTS_FILE line $((i + 1)) maps '${LINE_FIELDS[j]}' ahead of the managed block and will take precedence over it; remove that line" >&2
       fi
-    done <<< "$(hosts_line_hostnames "${HOSTS_LINES[i]}")"
+    done
   done
 }
 
-# Print the managed block for the entry list $1. Unless --clean was given, the
-# existing block's lines are updated in-place and unmatched ones are preserved.
+# Print the managed block. Unless --clean was given, the existing block's lines
+# are updated in-place and the ones that don't match an entry are preserved.
 render_block() {
-  local entries="$1"
   local -A written=()
-  local hostname i ip line new_ip
+  local hostname i line
 
   echo "$MARKER_BEGIN"
 
   if [[ "$CLEAN" == false ]] && (( BLOCK_BEGIN_IDX >= 0 )); then
     for ((i = BLOCK_BEGIN_IDX + 1; i < BLOCK_END_IDX; i++)); do
       line="${HOSTS_LINES[i]}"
-      hostname=$(hosts_line_hostname "$line")
-      new_ip=""
-      if [[ -n "$hostname" ]]; then
-        new_ip=$(entry_ip "$entries" "$hostname")
+      split_hosts_line "$line"
+      hostname=""
+      if (( ${#LINE_FIELDS[@]} > 1 )); then
+        hostname=${LINE_FIELDS[1],,}
       fi
-      if [[ -z "$new_ip" ]]; then
+      if [[ -z "$hostname" || -z "${ENTRY_IP[$hostname]+x}" ]]; then
         # Preserve existing lines in the block that don't match a new entry
         echo "$line"
       elif [[ -z "${written[$hostname]+x}" ]]; then
-        echo "$new_ip $hostname"
+        echo "${ENTRY_IP[$hostname]} $hostname"
         written[$hostname]=1
       fi
     done
   fi
 
   # Append the entries that didn't update an existing line
-  while IFS=' ' read -r ip hostname; do
-    if [[ -n "$hostname" && -z "${written[$hostname]+x}" ]]; then
-      echo "$ip $hostname"
+  for ((i = 0; i < ${#ENTRY_HOSTNAMES[@]}; i++)); do
+    hostname=${ENTRY_HOSTNAMES[i]}
+    if [[ -z "${written[$hostname]+x}" ]]; then
+      echo "${ENTRY_IP[$hostname]} $hostname"
+      written[$hostname]=1
     fi
-  done <<< "$entries"
+  done
 
   echo "$MARKER_END"
 }
 
-# Rewrite $HOSTS_FILE with the managed block set to the entry list $1
+# Rewrite $HOSTS_FILE with the managed block set to the indexed entries
 write_hosts_file() {
-  local entries="$1"
-  local i temp_file
+  local i link_count temp_file
 
   # Write beside the target so that the rename below is atomic, which keeps the
   # file resolvable at every instant and leaves no torn writes behind
@@ -289,30 +297,36 @@ write_hosts_file() {
     || temp_file=$(mktemp)
   # shellcheck disable=SC2064  # $temp_file is expanded now, on purpose
   trap "rm -f -- '$temp_file'" EXIT
-  # Copy first to inherit the original's ownership and permissions
-  cp -p "$HOSTS_FILE" "$temp_file"
+  # Copy first so the rewrite inherits the original's ownership and permissions,
+  # plus its extended attributes and security context where cp supports them
+  cp --preserve=all "$HOSTS_FILE" "$temp_file" 2>/dev/null \
+    || cp -p "$HOSTS_FILE" "$temp_file"
 
   {
     if (( BLOCK_BEGIN_IDX < 0 )); then
       for ((i = 0; i < ${#HOSTS_LINES[@]}; i++)); do
         echo "${HOSTS_LINES[i]}"
       done
-      render_block "$entries"
+      render_block
     else
       for ((i = 0; i < BLOCK_BEGIN_IDX; i++)); do
         echo "${HOSTS_LINES[i]}"
       done
-      render_block "$entries"
+      render_block
       for ((i = BLOCK_END_IDX + 1; i < ${#HOSTS_LINES[@]}; i++)); do
         echo "${HOSTS_LINES[i]}"
       done
     fi
   } > "$temp_file"
 
-  # A rename would replace a symlink rather than what it points at, and can't
-  # replace a bind mount at all - both of which are common for /etc/hosts - so
-  # fall back to overwriting in place whenever it isn't a plain file
-  if [[ -L "$HOSTS_FILE" ]] || ! mv -f "$temp_file" "$HOSTS_FILE" 2>/dev/null; then
+  link_count=$(stat -c %h "$HOSTS_FILE" 2>/dev/null || stat -f %l "$HOSTS_FILE" 2>/dev/null || echo 1)
+
+  # A rename would replace a symlink rather than what it points at, leave any
+  # hard links to the file behind on the old inode, and can't replace a bind
+  # mount at all - all three are plausible for /etc/hosts - so fall back to
+  # overwriting in place whenever the target isn't a standalone plain file
+  if [[ -L "$HOSTS_FILE" ]] || (( link_count > 1 )) \
+    || ! mv -f "$temp_file" "$HOSTS_FILE" 2>/dev/null; then
     cat "$temp_file" > "$HOSTS_FILE"
     rm -f -- "$temp_file"
   fi
@@ -330,16 +344,26 @@ if [[ -z "$entries" ]]; then
   fi
 fi
 
+build_entry_index "$entries"
+
+# Inspect the hosts file even for --dry-run, so that a preview reports the same
+# marker errors and shadowed entries that a real run would. A preview of a file
+# that doesn't exist yet is still worth printing, though.
+if [[ "$DRY_RUN" == false || -e "$HOSTS_FILE" ]]; then
+  validate_hosts_file
+  read_hosts_file
+  warn_shadowed_entries
+fi
+
 if [[ "$DRY_RUN" == true ]]; then
-  if [[ -n "$entries" ]]; then
-    echo "$entries"
-  else
+  if (( ${#ENTRY_HOSTNAMES[@]} == 0 )); then
     echo "Would remove all entries between '$MARKER_BEGIN' and '$MARKER_END' from $HOSTS_FILE"
+  else
+    for ((i = 0; i < ${#ENTRY_HOSTNAMES[@]}; i++)); do
+      echo "${ENTRY_IP[${ENTRY_HOSTNAMES[i]}]} ${ENTRY_HOSTNAMES[i]}"
+    done
   fi
   exit
 fi
 
-validate_hosts_file
-read_hosts_file
-warn_shadowed_entries "$entries"
-write_hosts_file "$entries"
+write_hosts_file

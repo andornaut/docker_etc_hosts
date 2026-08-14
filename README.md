@@ -11,7 +11,7 @@ Managed entries are wrapped in `# docker_etc_hosts BEGIN` / `# docker_etc_hosts 
 
 The new contents are built in full before the hosts file is written, and a run that wouldn't change anything doesn't write at all. The file is overwritten in place rather than renamed over, so that it keeps its inode: `/etc/hosts` is often a symlink, hard linked, or bind mounted into a container, and each of those would go on reading the replaced inode and never see another update. The cost of keeping it is a brief window during the rewrite in which the file is shorter than it should be.
 
-If the markers are unbalanced or duplicated — for example after a hand-edit — the script reports the offending line and exits without writing anything, rather than guessing at which entries it's allowed to delete.
+If the markers are unbalanced or duplicated (for example after a hand-edit), the script reports the offending line and exits without writing anything, rather than guessing at which entries it's allowed to delete.
 
 A container that can't be mapped cleanly is reported and skipped, so that one unusual container doesn't stop every other one from updating. That covers containers with no IP (host networking), containers whose name yields no valid hostname, and names that collide once normalized. A container attached to several networks uses the first of its addresses, since a hosts file maps a name to a single address.
 
@@ -28,7 +28,7 @@ For example, if you have running containers named `web_server` and `database`, t
 
 Linux, Docker, and bash 4+.
 
-macOS is explicitly unsupported, and the script exits rather than run there. Under Docker Desktop's default networking, container IPs aren't routable from the host, so the entries would name addresses nothing can reach. Runtimes that do route them — OrbStack, or Docker Desktop plus a tunnel such as [docker-mac-net-connect](https://github.com/chipmk/docker-mac-net-connect) — would additionally need a launchd daemon in place of the systemd unit and BSD-compatible tooling throughout. That isn't a trade this project makes.
+macOS is explicitly unsupported, and the script exits rather than run there. Under Docker Desktop's default networking, container IPs aren't routable from the host, so the entries would name addresses nothing can reach. Runtimes that do route them, such as OrbStack or Docker Desktop plus a tunnel like [docker-mac-net-connect](https://github.com/chipmk/docker-mac-net-connect), would additionally need a launchd daemon in place of the systemd unit and BSD-compatible tooling throughout. That isn't a trade this project makes.
 
 ## Installation
 
@@ -101,7 +101,7 @@ for containers that are no longer running are removed.
 
 ## Upgrading
 
-Rewriting the managed block is now the only behaviour, so `--clean` no longer does anything. It's still accepted, and service files installed by earlier versions keep working — though the unit above is now a plain `--watch` invocation and is worth reinstalling.
+Rewriting the managed block is now the only behaviour, so `--clean` no longer does anything. It's still accepted, and service files installed by earlier versions keep working, though the unit above is now a plain `--watch` invocation and is worth reinstalling.
 
 Versions that predate the marker comments wrote entries directly into `/etc/hosts`, outside any block. Those are left alone, and because the first match in a hosts file wins, one sitting ahead of the managed block will mask the entry this script maintains. If a container resolves to a stale address, look for a line above the `# docker_etc_hosts BEGIN` marker and delete it:
 

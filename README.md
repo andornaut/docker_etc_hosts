@@ -109,7 +109,7 @@ Versions that predate the marker comments wrote entries directly into `/etc/host
 grep -n '\.internal' /etc/hosts
 ```
 
-## Development
+## Developing
 
 [ShellCheck](https://www.shellcheck.net/) lints the scripts, and `test_docker_etc_hosts` exercises `docker_etc_hosts` against synthetic hosts files with a stubbed `docker` command. Both run in CI:
 

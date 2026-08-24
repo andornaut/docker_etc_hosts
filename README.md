@@ -1,6 +1,6 @@
 # docker_etc_hosts
 
-[![CI](https://github.com/andornaut/docker_etc_hosts/actions/workflows/test.yml/badge.svg)](https://github.com/andornaut/docker_etc_hosts/actions/workflows/test.yml)
+[![Test](https://github.com/andornaut/docker_etc_hosts/actions/workflows/test.yml/badge.svg)](https://github.com/andornaut/docker_etc_hosts/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/license/MIT)
 
 A lightweight bash script for Linux to add/update IP->hostname mappings in `/etc/hosts` for running Docker containers.

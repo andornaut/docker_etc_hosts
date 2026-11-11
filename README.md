@@ -121,4 +121,4 @@ shellcheck docker_etc_hosts test_docker_etc_hosts
 ## Development
 
 Run `make check` with Docker to check shell scripts and Markdown.
-`make check-info` lists the declared checks. The test target runs the shell suite with a stubbed Docker command.
+The native command `./test_docker_etc_hosts` runs the shell suite with a stubbed Docker command.

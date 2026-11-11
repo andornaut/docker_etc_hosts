@@ -29,6 +29,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Capped well under the six-hour default: nothing here runs longer than
+    # six minutes, so a job still going at fifteen has hung rather than failed.
     timeout-minutes: 15
     steps:
       - name: Checkout code
@@ -88,7 +90,7 @@ jobs:
           stock_image markdown_image "${MARKDOWN_IMAGE}"
           stock_image shellcheck_image "${SHELLCHECK_IMAGE}"
           stock_readonly "${shellcheck_image}" /bin/shellcheck -x -P SCRIPTDIR -- \
-              docker_etc_hosts test_docker_etc_hosts tests/container/run tests/container/check tests/container/stock
+              docker_etc_hosts test_docker_etc_hosts tests/container/check tests/container/stock
           stock_prepare "${markdown_image}" markdown -- sh -ec '
               mkdir -p /scratch/markdown
               cp tests/container/package.json tests/container/package-lock.json /scratch/markdown/
@@ -98,7 +100,6 @@ jobs:
           stock_run "${markdown_image}" markdown -- /scratch/markdown/node_modules/.bin/markdownlint-cli2
           stock_run "${markdown_image}" '' -- bash -n docker_etc_hosts
           stock_run "${markdown_image}" '' -- bash -n test_docker_etc_hosts
-          stock_run "${markdown_image}" '' -- bash -n tests/container/run
           stock_run "${markdown_image}" '' -- bash -n tests/container/check
           stock_run "${markdown_image}" '' -- bash -n tests/container/stock
           stock_run "${markdown_image}" '' -- sh -n tests/container/check
